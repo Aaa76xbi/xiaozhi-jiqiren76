@@ -1,0 +1,18 @@
+{
+    "type": "bread-compact-wifi-servo",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "bread-compact-wifi-servo",
+            "sdkconfig_append": [
+                "CONFIG_OLED_SSD1306_128X32=y"
+            ]
+        },
+        {
+            "name": "bread-compact-wifi-servo-128x64",
+            "sdkconfig_append": [
+                "CONFIG_OLED_SSD1306_128X64=y"
+            ]
+        }
+    ]
+}
