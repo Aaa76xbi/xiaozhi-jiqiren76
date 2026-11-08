@@ -71,6 +71,13 @@ same engine. On AFE targets, AEC stays active while wake-word detection is activ
 so playback reference remains available for wake-up during device playback. It
 also stays active during voice processing when device AEC is requested.
 
+Barge-in keeps that capture path running. Detecting the wake word must not
+reset the AFE or stop the microphone, and aborting TTS flushes the playback
+queue immediately. Speech fetched before uplink starts is held (up to one
+second) and emitted ahead of live audio, a frame or two at a time so the
+encode queue does not drop it. A normal listening turn still waits for
+playback to drain before opening the mic, so the tail of TTS is not transcribed.
+
 ## Output data flow
 
 ```mermaid

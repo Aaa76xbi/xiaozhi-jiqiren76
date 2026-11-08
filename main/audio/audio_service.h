@@ -136,6 +136,10 @@ public:
     void EnableWakeWordDetection(bool enable);
     void ReleaseWakeWordResources();
     void EnableVoiceProcessing(bool enable);
+    // Remember mic audio while voice processing is still off (barge-in).
+    void ArmBargeInCapture();
+    // Drop that audio. Used when opening a normal listening turn.
+    void DiscardPendingCapture();
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
