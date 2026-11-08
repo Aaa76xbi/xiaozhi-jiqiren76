@@ -21,6 +21,10 @@ public:
     virtual void EnableWakeWordDetection(bool enable) = 0;
     virtual void EnableVoiceProcessing(bool enable) = 0;
     virtual void EnableDeviceAec(bool enable) = 0;
+    // Keep mic audio that arrives before uplink starts. Default is a no-op.
+    virtual void ArmBargeInCapture() {}
+    // Drop audio held by ArmBargeInCapture() / wake-word handoff.
+    virtual void DiscardPendingCapture() {}
 
     virtual bool HasWakeWord() const = 0;
     virtual bool IsWakeWordDetectionEnabled() const = 0;

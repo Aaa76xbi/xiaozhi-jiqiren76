@@ -256,9 +256,19 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
-            if (GetDeviceState() == kDeviceStateListening) {
+            auto state = GetDeviceState();
+            if (state == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+            } else if (state == kDeviceStateSpeaking &&
+                       listening_mode_ == kListeningModeRealtime &&
+                       aec_mode_ == kAecOnDeviceSide && !aborted_.load() &&
+                       audio_service_.IsVoiceDetected()) {
+                // Device AEC has already removed the playback from the mic, so
+                // this edge is the user. Stop the speaker before the buffered
+                // TTS tail covers the rest of the utterance. Server-side AEC
+                // still hears the echo locally and must not take this path.
+                AbortSpeaking(kAbortReasonNone);
             }
         }
 
@@ -552,7 +562,9 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (GetDeviceState() == kDeviceStateSpeaking) {
+        // After a local barge-in, drop TTS that is already in flight. Playing
+        // it keeps the speaker on top of the user's first syllables.
+        if (GetDeviceState() == kDeviceStateSpeaking && !aborted_.load()) {
             audio_service_.PushPacketToDecodeQueue(std::move(packet));
         }
     });
@@ -623,7 +635,7 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
-                    aborted_ = false;
+                    aborted_.store(false);
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
@@ -909,10 +921,15 @@ void Application::HandleWakeWordDetectedEvent() {
         StopNotification();
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+        const bool uplink_already_running =
+            state == kDeviceStateSpeaking && audio_service_.IsAudioProcessorRunning();
         AbortSpeaking(kAbortReasonWakeWordDetected);
-        // Clear send queue to avoid sending residues to server
-        while (audio_service_.PopPacketFromSendQueue())
-            ;
+        // Packets left from the previous turn are not part of this utterance.
+        // Realtime barge-in is already uploading the interrupt, so keep those.
+        if (!uplink_already_running) {
+            while (audio_service_.PopPacketFromSendQueue()) {
+            }
+        }
 
         if (state == kDeviceStateListening) {
             protocol_->SendStartListening(GetDefaultListeningMode());
@@ -1034,7 +1051,11 @@ void Application::HandleStateChangedEvent() {
                 // voice processing. This prevents audio truncation when STOP arrives
                 // late due to network jitter. Instead of blocking the main loop here,
                 // defer the start until MAIN_EVENT_PLAYBACK_DRAINED arrives.
-                if (listening_mode_ == kListeningModeAutoStop && !audio_service_.IsPlaybackIdle()) {
+                // Natural end of TTS: wait until the buffered tail finishes so
+                // the mic does not upload it. A barge-in has already flushed
+                // that tail; waiting here is what drops the user's first words.
+                if (listening_mode_ == kListeningModeAutoStop && !aborted_.load() &&
+                    !audio_service_.IsPlaybackIdle()) {
                     pending_listening_start_ = true;
                 } else {
                     StartListeningAudio();
@@ -1077,14 +1098,24 @@ void Application::StartListeningAudio() {
 
     // Send the start listening command
     protocol_->SendStartListening(listening_mode_);
+    // Idle wake also arms the handoff buffer. Uploading it would prepend
+    // whatever was heard while the channel opened. Barge-in (aborted_) is
+    // the case that buffer exists to preserve.
+    if (!aborted_.load()) {
+        audio_service_.DiscardPendingCapture();
+    }
     audio_service_.EnableVoiceProcessing(true);
 
     ConfigureWakeWordForListening();
 
-    // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
+    // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called.
+    // Skip it after a barge-in: the mic is already open and the beep lands on
+    // top of the utterance we just preserved.
     if (play_popup_on_listening_) {
         play_popup_on_listening_ = false;
-        audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+        if (!aborted_.load()) {
+            audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+        }
     }
 }
 
@@ -1174,7 +1205,12 @@ void Application::Schedule(std::function<void()>&& callback) {
 
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
-    aborted_ = true;
+    // Stop playback before the protocol send. SendText can block, and every
+    // buffered TTS frame that keeps playing masks the start of the interrupt.
+    // Arm capture first so samples taken during that send are kept.
+    aborted_.store(true);
+    audio_service_.ArmBargeInCapture();
+    audio_service_.ResetDecoder();
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);
     }

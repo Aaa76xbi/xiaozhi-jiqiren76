@@ -1,6 +1,7 @@
 #include "afe_audio_engine.h"
 
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -62,6 +63,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
     codec_ = codec;
     frame_samples_ = frame_duration_ms * 16000 / 1000;
     output_buffer_.reserve(frame_samples_);
+    handoff_pcm_.reserve(kHandoffMaxSamples);
 
     if (models_list == nullptr) {
         models_ = esp_srmodel_init("model");
@@ -85,8 +87,7 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms,
         custom_wake_word_ = std::make_unique<CustomWakeWord>();
         custom_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
             last_detected_wake_word_ = wake_word;
-            xEventGroupClearBits(event_group_, kWakeWordEnabled);
-            UpdateActiveState();
+            ReleaseWakeWordForCaptureHandoff();
             if (wake_word_detected_callback_) {
                 wake_word_detected_callback_(wake_word);
             }
@@ -282,8 +283,10 @@ void AfeAudioEngine::EnableWakeWordDetection(bool enable) {
             custom_wake_word_->Start();
         }
         xEventGroupSetBits(event_group_, kWakeWordEnabled);
+        xEventGroupClearBits(event_group_, kCaptureHold);
     } else {
         xEventGroupClearBits(event_group_, kWakeWordEnabled);
+        xEventGroupClearBits(event_group_, kCaptureHold);
         if (wake_detector_ == WakeDetector::kMultiNet) {
             custom_wake_word_->Stop();
         }
@@ -294,11 +297,33 @@ void AfeAudioEngine::EnableWakeWordDetection(bool enable) {
 void AfeAudioEngine::EnableVoiceProcessing(bool enable) {
     if (enable) {
         xEventGroupSetBits(event_group_, kVoiceProcessingEnabled);
+        xEventGroupClearBits(event_group_, kCaptureHold);
     } else {
         xEventGroupClearBits(event_group_, kVoiceProcessingEnabled);
+        xEventGroupClearBits(event_group_, kCaptureHold);
         is_speaking_ = false;
+        handoff_discard_pending_.store(true);
     }
     UpdateActiveState();
+}
+
+void AfeAudioEngine::ArmBargeInCapture() {
+    if (afe_data_ == nullptr) {
+        return;
+    }
+    if ((xEventGroupGetBits(event_group_) & kVoiceProcessingEnabled) != 0) {
+        return;
+    }
+    // Speaking just disabled voice processing and requested a discard. That
+    // flag would otherwise reject the samples we are about to keep.
+    handoff_discard_pending_.store(false);
+    xEventGroupSetBits(event_group_, kCaptureHold);
+    UpdateActiveState();
+}
+
+void AfeAudioEngine::DiscardPendingCapture() {
+    xEventGroupClearBits(event_group_, kCaptureHold);
+    handoff_discard_pending_.store(true);
 }
 
 void AfeAudioEngine::EnableDeviceAec(bool enable) {
@@ -339,13 +364,14 @@ void AfeAudioEngine::OnVadStateChange(std::function<void(bool speaking)> callbac
 
 void AfeAudioEngine::UpdateActiveState() {
     EventBits_t bits = xEventGroupGetBits(event_group_);
-    const bool afe_active =
-        afe_data_ != nullptr && ((bits & kWakeWordEnabled) ||
-                                 (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)));
+    const bool afe_active = afe_data_ != nullptr &&
+                            ((bits & kWakeWordEnabled) || (bits & kCaptureHold) ||
+                             (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)));
     if (afe_active) {
         xEventGroupSetBits(event_group_, kAfeActive);
     } else {
         xEventGroupClearBits(event_group_, kAfeActive);
+        handoff_discard_pending_.store(true);
         control_generation_.fetch_add(1);
         std::lock_guard<std::mutex> lock(input_buffer_mutex_);
         input_buffer_.clear();
@@ -403,9 +429,75 @@ void AfeAudioEngine::ApplyPendingReset() {
     afe_iface_->reset_buffer(afe_data_);
 }
 
+void AfeAudioEngine::ReleaseWakeWordForCaptureHandoff() {
+    xEventGroupClearBits(event_group_, kWakeWordEnabled);
+    // Voice processing is still off during wake-word barge-in. Keep fetching
+    // so the speech that starts as the wake word ends stays in the pipeline
+    // instead of being wiped by reset_buffer().
+    if ((xEventGroupGetBits(event_group_) & kVoiceProcessingEnabled) == 0) {
+        xEventGroupSetBits(event_group_, kCaptureHold);
+    }
+    UpdateActiveState();
+}
+
+void AfeAudioEngine::DiscardHandoffIfRequested() {
+    if (handoff_discard_pending_.exchange(false)) {
+        handoff_pcm_.clear();
+    }
+}
+
+void AfeAudioEngine::AppendHandoff(const afe_fetch_result_t* result) {
+    if (handoff_discard_pending_.load() || result == nullptr || result->data == nullptr ||
+        result->data_size <= 0) {
+        return;
+    }
+    const size_t samples = result->data_size / sizeof(int16_t);
+    if (samples == 0) {
+        return;
+    }
+    if (handoff_pcm_.size() + samples > kHandoffMaxSamples) {
+        const size_t overflow = handoff_pcm_.size() + samples - kHandoffMaxSamples;
+        if (overflow >= handoff_pcm_.size()) {
+            handoff_pcm_.clear();
+        } else {
+            handoff_pcm_.erase(handoff_pcm_.begin(),
+                               handoff_pcm_.begin() + static_cast<std::ptrdiff_t>(overflow));
+        }
+    }
+    handoff_pcm_.insert(handoff_pcm_.end(), result->data, result->data + samples);
+}
+
+void AfeAudioEngine::EmitOutputFrames(int max_frames) {
+    if (!output_callback_ || max_frames <= 0) {
+        return;
+    }
+    // The encode queue holds only a couple of frames and this task outranks
+    // the encoder. Emitting the whole backlog here would drop the oldest
+    // frames, which are the barge-in onset. Leave the rest queued in
+    // output_buffer_; fetch_with_delay() lets the encoder drain.
+    int emitted = 0;
+    while (output_buffer_.size() >= static_cast<size_t>(frame_samples_) && emitted < max_frames) {
+        if (output_buffer_.size() == static_cast<size_t>(frame_samples_)) {
+            output_callback_(std::move(output_buffer_));
+            output_buffer_.clear();
+            output_buffer_.reserve(frame_samples_);
+        } else {
+            output_callback_(std::vector<int16_t>(output_buffer_.begin(),
+                                                  output_buffer_.begin() + frame_samples_));
+            output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
+        }
+        ++emitted;
+    }
+}
+
 void AfeAudioEngine::ProcessingTask() {
     while (true) {
         xEventGroupWaitBits(event_group_, kAfeActive, pdFALSE, pdTRUE, portMAX_DELAY);
+        // Consume a discard requested while this task was blocked in fetch.
+        // ArmBargeInCapture() clears the flag before new samples are kept, and
+        // DiscardPendingCapture() also drops kCaptureHold so nothing new is
+        // appended afterwards.
+        DiscardHandoffIfRequested();
         ApplyPendingReset();
         if ((xEventGroupGetBits(event_group_) & kAfeActive) == 0) {
             continue;
@@ -437,6 +529,8 @@ void AfeAudioEngine::ProcessingTask() {
         }
         if (kUseAfeForVoiceProcessing && (bits & kVoiceProcessingEnabled)) {
             HandleVoiceResult(result);
+        } else if (kUseAfeForVoiceProcessing && (bits & kCaptureHold)) {
+            AppendHandoff(result);
         }
     }
 }
@@ -461,10 +555,10 @@ void AfeAudioEngine::HandleWakeWordResult(const afe_fetch_result_t* result) {
     }
 
     last_detected_wake_word_ = wake_words_[model_index];
-    xEventGroupClearBits(event_group_, kWakeWordEnabled);
     // UpdateActiveState marks the AFE controls dirty; the next loop iteration
-    // of ProcessingTask disables WakeNet via ApplyAfeControls.
-    UpdateActiveState();
+    // of ProcessingTask disables WakeNet via ApplyAfeControls. Capture hold
+    // keeps the instance alive so that disable does not reset its buffer.
+    ReleaseWakeWordForCaptureHandoff();
     if (wake_word_detected_callback_) {
         wake_word_detected_callback_(last_detected_wake_word_);
     }
@@ -486,20 +580,22 @@ void AfeAudioEngine::HandleVoiceResult(const afe_fetch_result_t* result) {
     if (!output_callback_) {
         return;
     }
+    // A discard requested by the main task must win over audio already held,
+    // including a chunk appended just before uplink was enabled.
+    if (handoff_discard_pending_.exchange(false)) {
+        handoff_pcm_.clear();
+    }
+    if (!handoff_pcm_.empty()) {
+        const size_t preserved = handoff_pcm_.size();
+        output_buffer_.insert(output_buffer_.end(), handoff_pcm_.begin(), handoff_pcm_.end());
+        handoff_pcm_.clear();
+        ESP_LOGI(TAG, "Preserved %u ms of speech from before uplink start",
+                 static_cast<unsigned>(preserved * 1000 / 16000));
+    }
 
     size_t samples = result->data_size / sizeof(int16_t);
     output_buffer_.insert(output_buffer_.end(), result->data, result->data + samples);
-    while (output_buffer_.size() >= static_cast<size_t>(frame_samples_)) {
-        if (output_buffer_.size() == static_cast<size_t>(frame_samples_)) {
-            output_callback_(std::move(output_buffer_));
-            output_buffer_.clear();
-            output_buffer_.reserve(frame_samples_);
-        } else {
-            output_callback_(std::vector<int16_t>(output_buffer_.begin(),
-                                                  output_buffer_.begin() + frame_samples_));
-            output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
-        }
-    }
+    EmitOutputFrames(2);
 }
 
 void AfeAudioEngine::OutputRawAudio(const std::vector<int16_t>& data) {

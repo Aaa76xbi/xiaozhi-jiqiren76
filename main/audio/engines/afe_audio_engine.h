@@ -31,6 +31,8 @@ public:
     void EnableWakeWordDetection(bool enable) override;
     void EnableVoiceProcessing(bool enable) override;
     void EnableDeviceAec(bool enable) override;
+    void ArmBargeInCapture() override;
+    void DiscardPendingCapture() override;
 
     bool HasWakeWord() const override;
     bool IsWakeWordDetectionEnabled() const override;
@@ -56,7 +58,12 @@ private:
     static constexpr EventBits_t kWakeWordEnabled = 1 << 0;
     static constexpr EventBits_t kVoiceProcessingEnabled = 1 << 1;
     static constexpr EventBits_t kAfeActive = 1 << 2;
+    // Keeps the AFE fetching after wake-word detection until voice processing
+    // takes over, so reset_buffer() does not drop the start of the utterance.
+    static constexpr EventBits_t kCaptureHold = 1 << 3;
     static constexpr size_t kProcessingTaskStackSize = 4096;
+    // Speech captured between wake-word detection and uplink start.
+    static constexpr size_t kHandoffMaxSamples = 16000;  // 1s at 16 kHz
 
     AudioCodec* codec_ = nullptr;
     srmodel_list_t* models_ = nullptr;
@@ -76,6 +83,9 @@ private:
     std::atomic<bool> afe_control_dirty_{false};
     // Deferred output_buffer_ clear, performed by the output-producing task
     std::atomic<bool> output_reset_pending_{false};
+    // ProcessingTask clears handoff_pcm_ when this is set. Only that task
+    // reads or writes the buffer.
+    std::atomic<bool> handoff_discard_pending_{false};
     // Incremented whenever an active AFE session is invalidated. ProcessingTask
     // uses it to reject a fetch result produced before a disable/re-enable cycle.
     std::atomic<uint32_t> control_generation_{0};
@@ -86,6 +96,7 @@ private:
     std::string last_detected_wake_word_;
     std::vector<int16_t> input_buffer_;
     std::vector<int16_t> output_buffer_;
+    std::vector<int16_t> handoff_pcm_;
     std::mutex input_buffer_mutex_;
 
     std::function<void(const std::string&)> wake_word_detected_callback_;
@@ -105,6 +116,10 @@ private:
     void UpdateAecState();
     void ApplyAfeControls();
     void ApplyPendingReset();
+    void ReleaseWakeWordForCaptureHandoff();
+    void AppendHandoff(const afe_fetch_result_t* result);
+    void DiscardHandoffIfRequested();
+    void EmitOutputFrames(int max_frames);
     void OutputRawAudio(const std::vector<int16_t>& data);
     void HandleWakeWordResult(const afe_fetch_result_t* result);
     void HandleVoiceResult(const afe_fetch_result_t* result);

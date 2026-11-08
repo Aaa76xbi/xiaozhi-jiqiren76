@@ -94,7 +94,9 @@ void AudioService::Initialize(AudioCodec* codec) {
         }
     });
     audio_engine_->OnWakeWordDetected([this](const std::string& wake_word) {
-        xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
+        // Leave AS_EVENT_WAKE_WORD_RUNNING set. Clearing it stops AudioInputTask,
+        // and the samples spoken while the main loop switches to listening are
+        // gone before ASR starts. The engine disarms the detector itself.
         if (callbacks_.on_wake_word_detected) {
             callbacks_.on_wake_word_detected(wake_word);
         }
@@ -713,9 +715,20 @@ void AudioService::EnableVoiceProcessing(bool enable) {
         if (!InitializeAudioEngine()) {
             return;
         }
+        const bool already_running =
+            (xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING) != 0;
+        if (already_running) {
+            // Re-enabling mid-utterance used to reset the decoder and mute the
+            // mic for the warmup window, which clipped the start of a barge-in.
+            audio_engine_->EnableVoiceProcessing(true);
+            return;
+        }
         ResetDecoder();
-        audio_input_need_warmup_ = true;
-        {
+        // Warmup covers the pop when the codec input is first opened. The mic
+        // is already running for wake word during barge-in; delaying here
+        // drops the syllables the user is speaking right now.
+        if (!codec_->input_enabled()) {
+            audio_input_need_warmup_ = true;
             std::lock_guard<std::mutex> lock(input_resampler_mutex_);
             if (input_resampler_ != nullptr) {
                 esp_ae_rate_cvt_reset(input_resampler_);
@@ -728,6 +741,18 @@ void AudioService::EnableVoiceProcessing(bool enable) {
             audio_engine_->EnableVoiceProcessing(false);
         }
         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+    }
+}
+
+void AudioService::ArmBargeInCapture() {
+    if (audio_engine_ != nullptr) {
+        audio_engine_->ArmBargeInCapture();
+    }
+}
+
+void AudioService::DiscardPendingCapture() {
+    if (audio_engine_ != nullptr) {
+        audio_engine_->DiscardPendingCapture();
     }
 }
 
