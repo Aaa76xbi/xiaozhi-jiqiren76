@@ -4,10 +4,10 @@
 #include "codecs/no_audio_codec.h"
 #include "config.h"
 #include "display/oled_display.h"
+#include "dual_servo_controller.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
-#include "servo_controller.h"
 #include "system_reset.h"
 #include "wifi_board.h"
 
@@ -21,6 +21,28 @@
 #endif
 
 #define TAG "CompactWifiServoBoard"
+
+// Forwards protocol/alert emotions to the OLED and the head. OLED drawing stays in
+// OledDisplay; the servo side only queues a gesture.
+class ServoOledDisplay : public OledDisplay {
+public:
+    ServoOledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
+                     int height, bool mirror_x, bool mirror_y)
+        : OledDisplay(panel_io, panel, width, height, mirror_x, mirror_y) {}
+
+    void SetEmotion(const char* emotion) override {
+        OledDisplay::SetEmotion(emotion);
+        DualServoController::NotifyEmotion(emotion);
+    }
+};
+
+class ServoNoDisplay : public NoDisplay {
+public:
+    void SetEmotion(const char* emotion) override {
+        Display::SetEmotion(emotion);
+        DualServoController::NotifyEmotion(emotion);
+    }
+};
 
 class CompactWifiServoBoard : public WifiBoard {
 private:
@@ -91,7 +113,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_));
         if (esp_lcd_panel_init(panel_) != ESP_OK) {
             ESP_LOGE(TAG, "Failed to initialize display");
-            display_ = new NoDisplay();
+            display_ = new ServoNoDisplay();
             return;
         }
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, false));
@@ -100,8 +122,8 @@ private:
         ESP_LOGI(TAG, "Turning display on");
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
-                                   DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        display_ = new ServoOledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                        DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
     }
 
     void InitializeButtons() {
@@ -150,7 +172,7 @@ private:
     // 物联网初始化，逐步迁移到 MCP 协议
     void InitializeTools() {
         static LampController lamp(LAMP_GPIO);
-        static ServoController servo(SERVO_GPIO);
+        static DualServoController servos(SERVO_PAN_GPIO, SERVO_TILT_GPIO);
     }
 
 public:
@@ -159,10 +181,11 @@ public:
           touch_button_(TOUCH_BUTTON_GPIO),
           volume_up_button_(VOLUME_UP_BUTTON_GPIO),
           volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        // Center the head before the OLED init so a failed display still leaves the servos homed.
+        InitializeTools();
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
-        InitializeTools();
     }
 
     virtual Led* GetLed() override {

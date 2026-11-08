@@ -54,7 +54,10 @@
 // A MCP Test: Control a lamp
 #define LAMP_GPIO GPIO_NUM_18
 
-// SG90 舵机信号线（黄色），舵机使用外部 5V 供电并与开发板共地
-#define SERVO_GPIO GPIO_NUM_17
+// 双轴 SG90。pan 左右摇头，tilt 上下点头。
+// 舵机用外部 5V，并与开发板共地。信号是 3.3V PWM。
+// OLED 仍在 GPIO41/42。不要把屏幕改到 GPIO6/7，那是麦克风 DIN 和喇叭 DOUT。
+#define SERVO_PAN_GPIO GPIO_NUM_11
+#define SERVO_TILT_GPIO GPIO_NUM_10
 
 #endif  // _BOARD_CONFIG_H_
